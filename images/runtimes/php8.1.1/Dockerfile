@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
   re2c
 
 WORKDIR /root
-ARG VERSION=7.3.6
+ARG VERSION=8.1.1
 RUN curl -o php-${VERSION}.tar.gz https://www.php.net/distributions/php-${VERSION}.tar.gz
 RUN tar -zxf php-${VERSION}.tar.gz
 

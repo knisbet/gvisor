@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
   python
 
 WORKDIR /root
-ARG VERSION=v12.4.0
+ARG VERSION=v16.13.2
 RUN curl -o node-${VERSION}.tar.gz https://nodejs.org/dist/${VERSION}/node-${VERSION}.tar.gz
 RUN tar -zxf node-${VERSION}.tar.gz
 
