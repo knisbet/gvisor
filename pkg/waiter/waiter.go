@@ -75,8 +75,9 @@ const (
 	EventRdNorm   EventMask = 0x0040 // POLLRDNORM
 	EventWrNorm   EventMask = 0x0100 // POLLWRNORM
 	EventInternal EventMask = 0x1000
+	EventRdHUp    EventMask = 0x2000 // POLLRDHUP
 
-	allEvents      EventMask = 0x1f | EventRdNorm | EventWrNorm
+	AllEvents      EventMask = 0x1f | EventRdNorm | EventWrNorm | EventRdHUp
 	ReadableEvents EventMask = EventIn | EventRdNorm
 	WritableEvents EventMask = EventOut | EventWrNorm
 )
@@ -85,7 +86,7 @@ const (
 // from the Linux events e, which is in the format used by poll(2).
 func EventMaskFromLinux(e uint32) EventMask {
 	// Our flag definitions are currently identical to Linux.
-	return EventMask(e) & allEvents
+	return EventMask(e) & AllEvents
 }
 
 // ToLinux returns e in the format used by Linux poll(2).

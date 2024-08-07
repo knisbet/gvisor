@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"sync/atomic"
 	"unsafe"
 )
@@ -21,7 +22,7 @@ func (p *AtomicPtrCredentials) savePtr() *Credentials {
 	return p.Load()
 }
 
-func (p *AtomicPtrCredentials) loadPtr(v *Credentials) {
+func (p *AtomicPtrCredentials) loadPtr(_ context.Context, v *Credentials) {
 	p.Store(v)
 }
 
@@ -36,4 +37,9 @@ func (p *AtomicPtrCredentials) Load() *Credentials {
 // Store sets the value returned by Load to x.
 func (p *AtomicPtrCredentials) Store(x *Credentials) {
 	atomic.StorePointer(&p.ptr, (unsafe.Pointer)(x))
+}
+
+// Swap atomically stores `x` into *p and returns the previous *p value.
+func (p *AtomicPtrCredentials) Swap(x *Credentials) *Credentials {
+	return (*Credentials)(atomic.SwapPointer(&p.ptr, (unsafe.Pointer)(x)))
 }

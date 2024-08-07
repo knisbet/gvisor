@@ -117,8 +117,17 @@ func (t *Task) killedLocked() bool {
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) PrepareExit(ws linux.WaitStatus) {
+	t.tg.pidns.owner.mu.RLock()
+	defer t.tg.pidns.owner.mu.RUnlock()
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
+
+	last := t.tg.activeTasks == 1
+	if last {
+		t.prepareGroupExitLocked(ws)
+		return
+	}
+
 	t.exitStatus = ws
 }
 
@@ -133,6 +142,13 @@ func (t *Task) PrepareExit(ws linux.WaitStatus) {
 func (t *Task) PrepareGroupExit(ws linux.WaitStatus) {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
+	t.prepareGroupExitLocked(ws)
+}
+
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - The signal mutex must be locked.
+func (t *Task) prepareGroupExitLocked(ws linux.WaitStatus) {
 	if t.tg.exiting || t.tg.execing != nil {
 		// Note that if t.tg.exiting is false but t.tg.execing is not nil, i.e.
 		// this "group exit" is being executed by the killed sibling of an
@@ -214,7 +230,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 			info.ContextData = &pb.ContextData{}
 			LoadSeccheckData(t, fields.Context, info.ContextData)
 		}
-		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.TaskExit(t, fields, info)
 		})
 	}
@@ -269,16 +285,19 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.LeaveCgroups()
 
 	t.mu.Lock()
-	mntns := t.mountNamespaceVFS2
-	t.mountNamespaceVFS2 = nil
+	mntns := t.mountNamespace
+	t.mountNamespace = nil
+	utsns := t.utsns
+	t.utsns = nil
 	ipcns := t.ipcns
-	netns := t.NetworkNamespace()
+	t.ipcns = nil
+	netns := t.netns
+	t.netns = nil
 	t.mu.Unlock()
-	if mntns != nil {
-		mntns.DecRef(t)
-	}
+	mntns.DecRef(t)
+	utsns.DecRef(t)
 	ipcns.DecRef(t)
-	netns.DecRef()
+	netns.DecRef(t)
 
 	// If this is the last task to exit from the thread group, release the
 	// thread group's resources.
@@ -381,6 +400,8 @@ func (t *Task) exitChildren() {
 // findReparentTargetLocked returns the task to which t's children should be
 // reparented. If no such task exists, findNewParentLocked returns nil.
 //
+// This corresponds to Linux's find_new_reaper().
+//
 // Preconditions: The TaskSet mutex must be locked.
 func (t *Task) findReparentTargetLocked() *Task {
 	// Reparent to any sibling in the same thread group that hasn't begun
@@ -388,12 +409,35 @@ func (t *Task) findReparentTargetLocked() *Task {
 	if t2 := t.tg.anyNonExitingTaskLocked(); t2 != nil {
 		return t2
 	}
-	// "A child process that is orphaned within the namespace will be
-	// reparented to [the init process for the namespace] ..." -
-	// pid_namespaces(7)
-	if init := t.tg.pidns.tasks[InitTID]; init != nil {
-		return init.tg.anyNonExitingTaskLocked()
+
+	if !t.tg.hasChildSubreaper {
+		// No child subreaper exists. We can immediately return the
+		// init process in this PID namespace if it exists.
+		if init := t.tg.pidns.tasks[initTID]; init != nil {
+			return init.tg.anyNonExitingTaskLocked()
+		}
+		return nil
 	}
+
+	// Walk up the process tree until we either find a subreaper, or we hit
+	// the init process in the PID namespace.
+	for parent := t.parent; parent != nil; parent = parent.parent {
+		if parent.tg.isInitInLocked(parent.PIDNamespace()) {
+			// We found the init process for this pid namespace,
+			// return a task from it. If the init process is
+			// exiting, this might return nil.
+			return parent.tg.anyNonExitingTaskLocked()
+		}
+		if parent.tg.isChildSubreaper {
+			// We found a subreaper process. Return a non-exiting
+			// task if there is one, otherwise keep walking up the
+			// process tree.
+			if target := parent.tg.anyNonExitingTaskLocked(); target != nil {
+				return target
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -668,7 +712,7 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 			// Clone or Exec events for the initial process.
 			if t.tg != t.k.globalInit && seccheck.Global.Enabled(seccheck.PointExitNotifyParent) {
 				mask, info := getExitNotifyParentSeccheckInfo(t)
-				if err := seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+				if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 					return c.ExitNotifyParent(t, mask, info)
 				}); err != nil {
 					log.Infof("Ignoring error from ExitNotifyParent point: %v", err)
@@ -732,7 +776,9 @@ func getExitNotifyParentSeccheckInfo(t *Task) (seccheck.FieldSet, *pb.ExitNotify
 	}
 	if !fields.Context.Empty() {
 		info.ContextData = &pb.ContextData{}
-		LoadSeccheckDataLocked(t, fields.Context, info.ContextData)
+		// cwd isn't used for notifyExit seccheck so it's ok to pass an empty
+		// string.
+		LoadSeccheckDataLocked(t, fields.Context, info.ContextData, "")
 	}
 
 	return fields, info
@@ -1065,7 +1111,7 @@ func (t *Task) waitCollectZombieLocked(target *Task, opts *WaitOptions, asPtrace
 	// will be reaped here.
 	if tracer := target.Tracer(); tracer != nil && tracer.tg == t.tg && target.exitTracerNotified {
 		target.exitTracerAcked = true
-		target.ptraceTracer.Store((*Task)(nil))
+		target.ptraceTracer.Store(nil)
 		delete(t.ptraceTracees, target)
 	}
 	if target.parent != nil && target.parent.tg == t.tg && target.exitParentNotified {

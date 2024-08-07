@@ -15,9 +15,15 @@
 package kernel
 
 import (
-	"gvisor.dev/gvisor/pkg/sentry/device"
+	"context"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
+
+// afterLoad is invoked by stateify.
+func (ts *TaskSet) afterLoad(_ context.Context) {
+	ts.zeroLiveTasksCond.L = &ts.mu
+}
 
 // saveDanglingEndpoints is invoked by stateify.
 func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
@@ -25,18 +31,8 @@ func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
 }
 
 // loadDanglingEndpoints is invoked by stateify.
-func (k *Kernel) loadDanglingEndpoints(es []tcpip.Endpoint) {
+func (k *Kernel) loadDanglingEndpoints(_ context.Context, es []tcpip.Endpoint) {
 	for _, e := range es {
 		tcpip.AddDanglingEndpoint(e)
 	}
-}
-
-// saveDeviceRegistry is invoked by stateify.
-func (k *Kernel) saveDeviceRegistry() *device.Registry {
-	return device.SimpleDevices
-}
-
-// loadDeviceRegistry is invoked by stateify.
-func (k *Kernel) loadDeviceRegistry(r *device.Registry) {
-	device.SimpleDevices.LoadFrom(r)
 }

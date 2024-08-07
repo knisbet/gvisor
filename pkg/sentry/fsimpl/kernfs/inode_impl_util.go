@@ -191,6 +191,11 @@ type InodeAttrs struct {
 
 // Init initializes this InodeAttrs.
 func (a *InodeAttrs) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, mode linux.FileMode) {
+	a.InitWithIDs(ctx, creds.EffectiveKUID, creds.EffectiveKGID, devMajor, devMinor, ino, mode)
+}
+
+// InitWithIDs initializes this InodeAttrs.
+func (a *InodeAttrs) InitWithIDs(ctx context.Context, uid auth.KUID, gid auth.KGID, devMajor, devMinor uint32, ino uint64, mode linux.FileMode) {
 	if mode.FileType() == 0 {
 		panic(fmt.Sprintf("No file type specified in 'mode' for InodeAttrs.Init(): mode=0%o", mode))
 	}
@@ -203,8 +208,8 @@ func (a *InodeAttrs) Init(ctx context.Context, creds *auth.Credentials, devMajor
 	a.devMinor = devMinor
 	a.ino.Store(ino)
 	a.mode.Store(uint32(mode))
-	a.uid.Store(uint32(creds.EffectiveKUID))
-	a.gid.Store(uint32(creds.EffectiveKGID))
+	a.uid.Store(uint32(uid))
+	a.gid.Store(uint32(gid))
 	a.nlink.Store(nlink)
 	a.blockSize.Store(hostarch.PageSize)
 	now := ktime.NowFromContext(ctx).Nanoseconds()
@@ -228,6 +233,16 @@ func (a *InodeAttrs) Ino() uint64 {
 	return a.ino.Load()
 }
 
+// UID implements Inode.UID.
+func (a *InodeAttrs) UID() auth.KUID {
+	return auth.KUID(a.uid.Load())
+}
+
+// GID implements Inode.GID.
+func (a *InodeAttrs) GID() auth.KGID {
+	return auth.KGID(a.gid.Load())
+}
+
 // Mode implements Inode.Mode.
 func (a *InodeAttrs) Mode() linux.FileMode {
 	return linux.FileMode(a.mode.Load())
@@ -240,7 +255,7 @@ func (a *InodeAttrs) Links() uint32 {
 
 // TouchAtime updates a.atime to the current time.
 func (a *InodeAttrs) TouchAtime(ctx context.Context, mnt *vfs.Mount) {
-	if mnt.Flags.NoATime || mnt.ReadOnly() {
+	if opts := mnt.Options(); opts.Flags.NoATime || opts.ReadOnly {
 		return
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
@@ -501,7 +516,7 @@ func (o *OrderedChildren) Lookup(ctx context.Context, name string) (Inode, error
 	return s.inode, nil
 }
 
-// ForEachChild calls fn on all childrens tracked by this ordered children.
+// ForEachChild calls fn on all children tracked by this ordered children.
 func (o *OrderedChildren) ForEachChild(fn func(string, Inode)) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -714,8 +729,10 @@ type StaticDirectory struct {
 	InodeAttrs
 	InodeDirectoryNoNewChildren
 	InodeNoStatFS
+	InodeNotAnonymous
 	InodeNotSymlink
 	InodeTemporary
+	InodeWatches
 	OrderedChildren
 	StaticDirectoryRefs
 
@@ -772,7 +789,7 @@ func (s *StaticDirectory) DecRef(ctx context.Context) {
 type InodeAlwaysValid struct{}
 
 // Valid implements Inode.Valid.
-func (*InodeAlwaysValid) Valid(context.Context) bool {
+func (*InodeAlwaysValid) Valid(context.Context, *Dentry, string) bool {
 	return true
 }
 
@@ -795,4 +812,36 @@ type InodeNoStatFS struct{}
 // StatFS implements Inode.StatFS.
 func (*InodeNoStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
 	return linux.Statfs{}, linuxerr.ENOSYS
+}
+
+// InodeWatches partially implements Inode.
+//
+// +stateify savable
+type InodeWatches struct {
+	watches vfs.Watches
+}
+
+// Watches implements Inode.Watches.
+func (i *InodeWatches) Watches() *vfs.Watches {
+	return &i.watches
+}
+
+// InodeAnonymous partially implements Inode.
+//
+// +stateify savable
+type InodeAnonymous struct{}
+
+// Anonymous implements Inode.Anonymous
+func (*InodeAnonymous) Anonymous() bool {
+	return true
+}
+
+// InodeNotAnonymous partially implements Inode.
+//
+// +stateify savable
+type InodeNotAnonymous struct{}
+
+// Anonymous implements Inode.Anonymous
+func (*InodeNotAnonymous) Anonymous() bool {
+	return false
 }

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.12
-// +build go1.12
+//go:build go1.18
+// +build go1.18
 
 // //go:linkname directives type-checked by checklinkname. Any other
 // non-linkname assumptions outside the Go 1 compatibility guarantee should
@@ -26,6 +26,7 @@ import (
 	"math"
 	"runtime"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -55,10 +56,11 @@ func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, f
 	}
 
 	// Set the region.
-	_, _, errno := unix.RawSyscall(
+	// Note: syscall.RawSyscall is used to fit the nosplit stack limit.
+	_, _, errno := syscall.RawSyscall(
 		unix.SYS_IOCTL,
 		uintptr(m.fd),
-		_KVM_SET_USER_MEMORY_REGION,
+		KVM_SET_USER_MEMORY_REGION,
 		uintptr(unsafe.Pointer(&userRegion)))
 	return errno
 }
@@ -166,7 +168,7 @@ func (c *vCPU) setSignalMask() error {
 	if _, _, errno := unix.RawSyscall(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_SIGNAL_MASK,
+		KVM_SET_SIGNAL_MASK,
 		uintptr(unsafe.Pointer(&data))); errno != 0 {
 		return fmt.Errorf("error setting signal mask: %v", errno)
 	}

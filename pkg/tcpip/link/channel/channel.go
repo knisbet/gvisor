@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package channel provides the implemention of channel-based data-link layer
+// Package channel provides the implementation of channel-based data-link layer
 // endpoints. Such endpoints allow injection of inbound packets and store
 // outbound packets in a channel.
 package channel
@@ -54,7 +54,9 @@ type queue struct {
 func (q *queue) Close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	close(q.c)
+	if !q.closed {
+		close(q.c)
+	}
 	q.closed = true
 }
 
@@ -134,12 +136,19 @@ var _ stack.GSOEndpoint = (*Endpoint)(nil)
 
 // Endpoint is link layer endpoint that stores outbound packets in a channel
 // and allows injection of inbound packets.
+//
+// +stateify savable
 type Endpoint struct {
-	dispatcher         stack.NetworkDispatcher
-	mtu                uint32
-	linkAddr           tcpip.LinkAddress
 	LinkEPCapabilities stack.LinkEndpointCapabilities
 	SupportedGSOKind   stack.SupportedGSO
+
+	mu sync.RWMutex `state:"nosave"`
+	// +checklocks:mu
+	dispatcher stack.NetworkDispatcher
+	// +checklocks:mu
+	linkAddr tcpip.LinkAddress
+	// +checklocks:mu
+	mtu uint32
 
 	// Outbound packet queue.
 	q *queue
@@ -189,26 +198,44 @@ func (e *Endpoint) NumQueued() int {
 	return e.q.Num()
 }
 
-// InjectInbound injects an inbound packet.
+// InjectInbound injects an inbound packet. If the endpoint is not attached, the
+// packet is not delivered.
 func (e *Endpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	e.dispatcher.DeliverNetworkPacket(protocol, pkt)
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	if d != nil {
+		d.DeliverNetworkPacket(protocol, pkt)
+	}
 }
 
 // Attach saves the stack network-layer dispatcher for use later when packets
 // are injected.
 func (e *Endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.dispatcher = dispatcher
 }
 
 // IsAttached implements stack.LinkEndpoint.IsAttached.
 func (e *Endpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.dispatcher != nil
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *Endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU.
+func (e *Endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -234,7 +261,16 @@ func (*Endpoint) MaxHeaderLength() uint16 {
 
 // LinkAddress returns the link address of this endpoint.
 func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.linkAddr
+}
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *Endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.linkAddr = addr
 }
 
 // WritePackets stores outbound packets into the channel.
@@ -275,3 +311,9 @@ func (*Endpoint) ARPHardwareType() header.ARPHardwareType {
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
 func (*Endpoint) AddHeader(*stack.PacketBuffer) {}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (*Endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// SetOnCloseAction implements stack.LinkEndpoint.
+func (*Endpoint) SetOnCloseAction(func()) {}

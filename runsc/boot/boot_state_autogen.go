@@ -3,6 +3,8 @@
 package boot
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -13,7 +15,6 @@ func (f *sandboxNetstackCreator) StateTypeName() string {
 func (f *sandboxNetstackCreator) StateFields() []string {
 	return []string{
 		"clock",
-		"uniqueID",
 		"allowPacketEndpointWrite",
 	}
 }
@@ -24,17 +25,15 @@ func (f *sandboxNetstackCreator) beforeSave() {}
 func (f *sandboxNetstackCreator) StateSave(stateSinkObject state.Sink) {
 	f.beforeSave()
 	stateSinkObject.Save(0, &f.clock)
-	stateSinkObject.Save(1, &f.uniqueID)
-	stateSinkObject.Save(2, &f.allowPacketEndpointWrite)
+	stateSinkObject.Save(1, &f.allowPacketEndpointWrite)
 }
 
-func (f *sandboxNetstackCreator) afterLoad() {}
+func (f *sandboxNetstackCreator) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (f *sandboxNetstackCreator) StateLoad(stateSourceObject state.Source) {
+func (f *sandboxNetstackCreator) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.clock)
-	stateSourceObject.Load(1, &f.uniqueID)
-	stateSourceObject.Load(2, &f.allowPacketEndpointWrite)
+	stateSourceObject.Load(1, &f.allowPacketEndpointWrite)
 }
 
 func init() {

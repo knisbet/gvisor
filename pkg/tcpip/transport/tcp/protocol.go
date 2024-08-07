@@ -16,13 +16,15 @@
 package tcp
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"runtime"
 	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/hash/jenkins"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
 	"gvisor.dev/gvisor/pkg/tcpip/internal/tcp"
@@ -84,10 +86,11 @@ const (
 	ccCubic = "cubic"
 )
 
+// +stateify savable
 type protocol struct {
 	stack *stack.Stack
 
-	mu                         sync.RWMutex
+	mu                         sync.RWMutex `state:"nosave"`
 	sackEnabled                bool
 	recovery                   tcpip.TCPRecovery
 	delayEnabled               bool
@@ -107,9 +110,8 @@ type protocol struct {
 	dispatcher                 dispatcher
 
 	// The following secrets are initialized once and stay unchanged after.
-	seqnumSecret     uint32
-	portOffsetSecret uint32
-	tsOffsetSecret   uint32
+	seqnumSecret   [16]byte
+	tsOffsetSecret [16]byte
 }
 
 // Number returns the tcp protocol number.
@@ -178,16 +180,15 @@ func (p *protocol) tsOffset(src, dst tcpip.Address) tcp.TSOffset {
 	//
 	// See https://tools.ietf.org/html/rfc7323#section-5.4 for details on
 	// why this is required.
-	//
-	// TODO(https://gvisor.dev/issues/6473): This is not really secure as
-	// it does not use the recommended algorithm linked above.
-	h := jenkins.Sum32(p.tsOffsetSecret)
+	h := sha256.New()
+
 	// Per hash.Hash.Writer:
 	//
 	// It never returns an error.
-	_, _ = h.Write([]byte(src))
-	_, _ = h.Write([]byte(dst))
-	return tcp.NewTSOffset(h.Sum32())
+	_, _ = h.Write(p.tsOffsetSecret[:])
+	_, _ = h.Write(src.AsSlice())
+	_, _ = h.Write(dst.AsSlice())
+	return tcp.NewTSOffset(binary.LittleEndian.Uint32(h.Sum(nil)[:4]))
 }
 
 // replyWithReset replies to the given segment with a reset segment.
@@ -480,6 +481,13 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 	}
 }
 
+// SendBufferSize implements stack.SendBufSizeProto.
+func (p *protocol) SendBufferSize() tcpip.TCPSendBufferSizeRangeOption {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.sendBufferSize
+}
+
 // Close implements stack.TransportProtocol.Close.
 func (p *protocol) Close() {
 	p.dispatcher.close()
@@ -505,8 +513,29 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 	return parse.TCP(pkt)
 }
 
-// NewProtocol returns a TCP transport protocol.
+// NewProtocol returns a TCP transport protocol with Reno congestion control.
 func NewProtocol(s *stack.Stack) stack.TransportProtocol {
+	return newProtocol(s, ccReno)
+}
+
+// NewProtocolCUBIC returns a TCP transport protocol with CUBIC congestion
+// control.
+//
+// TODO(b/345835636): Remove this and make CUBIC the default across the board.
+func NewProtocolCUBIC(s *stack.Stack) stack.TransportProtocol {
+	return newProtocol(s, ccCubic)
+}
+
+func newProtocol(s *stack.Stack, cc string) stack.TransportProtocol {
+	rng := s.SecureRNG()
+	var seqnumSecret [16]byte
+	var tsOffsetSecret [16]byte
+	if n, err := rng.Reader.Read(seqnumSecret[:]); err != nil || n != len(seqnumSecret) {
+		panic(fmt.Sprintf("Read() failed: %v", err))
+	}
+	if n, err := rng.Reader.Read(tsOffsetSecret[:]); err != nil || n != len(tsOffsetSecret) {
+		panic(fmt.Sprintf("Read() failed: %v", err))
+	}
 	p := protocol{
 		stack: s,
 		sendBufferSize: tcpip.TCPSendBufferSizeRangeOption{
@@ -519,8 +548,10 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 			Default: DefaultReceiveBufferSize,
 			Max:     MaxBufferSize,
 		},
-		congestionControl:          ccReno,
+		sackEnabled:                true,
+		congestionControl:          cc,
 		availableCongestionControl: []string{ccReno, ccCubic},
+		moderateReceiveBuffer:      true,
 		lingerTimeout:              DefaultTCPLingerTimeout,
 		timeWaitTimeout:            DefaultTCPTimeWaitTimeout,
 		timeWaitReuse:              tcpip.TCPTimeWaitReuseLoopbackOnly,
@@ -529,11 +560,10 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 		maxRTO:                     MaxRTO,
 		maxRetries:                 MaxRetries,
 		recovery:                   tcpip.TCPRACKLossDetection,
-		seqnumSecret:               s.Rand().Uint32(),
-		portOffsetSecret:           s.Rand().Uint32(),
-		tsOffsetSecret:             s.Rand().Uint32(),
+		seqnumSecret:               seqnumSecret,
+		tsOffsetSecret:             tsOffsetSecret,
 	}
-	p.dispatcher.init(s.Rand(), runtime.GOMAXPROCS(0))
+	p.dispatcher.init(s.InsecureRNG(), runtime.GOMAXPROCS(0))
 	return &p
 }
 

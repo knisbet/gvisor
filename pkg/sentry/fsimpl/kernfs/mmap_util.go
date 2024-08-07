@@ -18,7 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -28,6 +28,8 @@ import (
 //
 // +stateify savable
 type inodePlatformFile struct {
+	memmap.NoBufferedIOFallback
+
 	// hostFD contains the host fd that this file was originally created from,
 	// which must be available at time of restore.
 	//
@@ -52,9 +54,9 @@ type inodePlatformFile struct {
 var _ memmap.File = (*inodePlatformFile)(nil)
 
 // IncRef implements memmap.File.IncRef.
-func (i *inodePlatformFile) IncRef(fr memmap.FileRange) {
+func (i *inodePlatformFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 	i.fdRefsMu.Lock()
-	i.fdRefs.IncRefAndAccount(fr)
+	i.fdRefs.IncRefAndAccount(fr, memCgID)
 	i.fdRefsMu.Unlock()
 }
 

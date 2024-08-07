@@ -25,9 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -103,35 +103,65 @@ const (
 	vCPUWaiter uint32 = 1 << 2
 )
 
+// Field values for the get_vcpu metric acquisition path used.
+var (
+	getVCPUAcquisitionFastReused = metric.FieldValue{"fast_reused"}
+	getVCPUAcquisitionReused     = metric.FieldValue{"reused"}
+	getVCPUAcquisitionUnused     = metric.FieldValue{"unused"}
+	getVCPUAcquisitionStolen     = metric.FieldValue{"stolen"}
+)
+
 var (
 	// hostExitCounter is a metric that tracks how many times the sentry
 	// performed a host to guest world switch.
-	hostExitCounter = metric.MustCreateNewUint64Metric(
-		"/kvm/host_exits", false, "The number of times the sentry performed a host to guest world switch.")
+	hostExitCounter = KVMProfiling.MustCreateNewUint64Metric(
+		"/kvm/host_exits",
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of times the sentry performed a host to guest world switch.",
+		})
 
 	// userExitCounter is a metric that tracks how many times the sentry has
 	// had an exit from userspace. Analogous to vCPU.userExits.
-	userExitCounter = metric.MustCreateNewUint64Metric(
-		"/kvm/user_exits", false, "The number of times the sentry has had an exit from userspace.")
+	userExitCounter = KVMProfiling.MustCreateNewUint64Metric(
+		"/kvm/user_exits",
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of times the sentry has had an exit from userspace.",
+		})
 
 	// interruptCounter is a metric that tracks how many times execution returned
 	// to the KVM host to handle a pending signal.
-	interruptCounter = metric.MustCreateNewUint64Metric(
-		"/kvm/interrupts", false, "The number of times the signal handler was invoked.")
+	interruptCounter = KVMProfiling.MustCreateNewUint64Metric(
+		"/kvm/interrupts",
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of times the signal handler was invoked.",
+		})
 
 	// mmapCallCounter is a metric that tracks how many times the function
 	// seccompMmapSyscall has been called.
-	mmapCallCounter = metric.MustCreateNewUint64Metric(
-		"/kvm/mmap_calls", false, "The number of times seccompMmapSyscall has been called.")
+	mmapCallCounter = KVMProfiling.MustCreateNewUint64Metric(
+		"/kvm/mmap_calls",
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of times seccompMmapSyscall has been called.",
+		})
 
 	// getVCPUCounter is a metric that tracks how many times different paths of
 	// machine.Get() are triggered.
-	getVCPUCounter = metric.MustCreateNewUint64Metric(
-		"/kvm/get_vcpu", false, "The number of times that machine.Get() was called, split by path the function took.",
-		metric.NewField("acquisition_type", []string{"fast_reused", "reused", "unused", "stolen"}))
+	getVCPUCounter = KVMProfiling.MustCreateNewUint64Metric(
+		"/kvm/get_vcpu",
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of times that machine.Get() was called, split by path the function took.",
+			Fields: []metric.Field{
+				metric.NewField("acquisition_type", &getVCPUAcquisitionFastReused, &getVCPUAcquisitionReused, &getVCPUAcquisitionUnused, &getVCPUAcquisitionStolen),
+			},
+		})
 
 	// asInvalidateDuration are durations of calling addressSpace.invalidate().
-	asInvalidateDuration = metric.MustRegisterTimerMetric("/kvm/address_space_invalidate",
+	asInvalidateDuration = KVMProfiling.MustCreateNewTimerMetric("/kvm/address_space_invalidate",
 		metric.NewExponentialBucketer(15, uint64(time.Nanosecond*100), 1, 2),
 		"Duration of calling addressSpace.invalidate().")
 )
@@ -198,7 +228,7 @@ type dieState struct {
 // Precondition: mu must be held.
 func (m *machine) createVCPU(id int) *vCPU {
 	// Create the vCPU.
-	fd, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CREATE_VCPU, uintptr(id))
+	fd, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CREATE_VCPU, uintptr(id))
 	if errno != 0 {
 		panic(fmt.Sprintf("error creating new vCPU: %v", errno))
 	}
@@ -245,7 +275,7 @@ func newMachine(vm int) (*machine, error) {
 	m.kernel.Init(m.maxVCPUs)
 
 	// Pull the maximum slots.
-	maxSlots, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
+	maxSlots, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
 	if errno != 0 {
 		m.maxSlots = _KVM_NR_MEMSLOTS
 	} else {
@@ -255,7 +285,7 @@ func newMachine(vm int) (*machine, error) {
 	m.usedSlots = make([]uintptr, m.maxSlots)
 
 	// Check TSC Scaling
-	hasTSCControl, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
+	hasTSCControl, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
 	m.tscControl = errno == 0 && hasTSCControl == 1
 	log.Debugf("TSC scaling support: %t.", m.tscControl)
 
@@ -372,7 +402,7 @@ func (m *machine) hasSlot(physical uintptr) bool {
 // mapPhysical checks for the mapping of a physical range, and installs one if
 // not available. This attempts to be efficient for calls in the hot path.
 //
-// This panics on error.
+// This throws on error.
 //
 //go:nosplit
 func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalRegion) {
@@ -380,13 +410,13 @@ func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalReg
 		_, physicalStart, length, pr := calculateBluepillFault(physical, phyRegions)
 		if pr == nil {
 			// Should never happen.
-			panic("mapPhysical on unknown physical address")
+			throw("mapPhysical on unknown physical address")
 		}
 
 		// Is this already mapped? Check the usedSlots.
 		if !m.hasSlot(physicalStart) {
 			if _, ok := handleBluepillFault(m, physical, phyRegions); !ok {
-				panic("handleBluepillFault failed")
+				throw("handleBluepillFault failed")
 			}
 		}
 
@@ -442,18 +472,18 @@ func (m *machine) Destroy() {
 //
 // It is guaranteed that if any OS thread TID is in guest, m.vCPUs[TID] points
 // to the vCPU in which the OS thread TID is running. So if Get() returns with
-// the corrent context in guest, the vCPU of it must be the same as what
+// the current context in guest, the vCPU of it must be the same as what
 // Get() returns.
 func (m *machine) Get() *vCPU {
 	m.mu.RLock()
 	runtime.LockOSThread()
-	tid := procid.Current()
+	tid := hosttid.Current()
 
 	// Check for an exact match.
 	if c := m.vCPUsByTID[tid]; c != nil {
 		c.lock()
 		m.mu.RUnlock()
-		getVCPUCounter.Increment("fast_reused")
+		getVCPUCounter.Increment(&getVCPUAcquisitionFastReused)
 		return c
 	}
 
@@ -467,13 +497,13 @@ func (m *machine) Get() *vCPU {
 	runtime.UnlockOSThread()
 	m.mu.Lock()
 	runtime.LockOSThread()
-	tid = procid.Current()
+	tid = hosttid.Current()
 
 	// Recheck for an exact match.
 	if c := m.vCPUsByTID[tid]; c != nil {
 		c.lock()
 		m.mu.Unlock()
-		getVCPUCounter.Increment("reused")
+		getVCPUCounter.Increment(&getVCPUAcquisitionReused)
 		return c
 	}
 
@@ -486,7 +516,7 @@ func (m *machine) Get() *vCPU {
 			m.vCPUsByTID[tid] = c
 			m.mu.Unlock()
 			c.loadSegments(tid)
-			getVCPUCounter.Increment("unused")
+			getVCPUCounter.Increment(&getVCPUAcquisitionUnused)
 			return c
 		}
 
@@ -497,7 +527,7 @@ func (m *machine) Get() *vCPU {
 				m.vCPUsByTID[tid] = c
 				m.mu.Unlock()
 				c.loadSegments(tid)
-				getVCPUCounter.Increment("unused")
+				getVCPUCounter.Increment(&getVCPUAcquisitionUnused)
 				return c
 			}
 		}
@@ -525,7 +555,7 @@ func (m *machine) Get() *vCPU {
 			m.vCPUsByTID[tid] = c
 			m.mu.Unlock()
 			c.loadSegments(tid)
-			getVCPUCounter.Increment("stolen")
+			getVCPUCounter.Increment(&getVCPUAcquisitionStolen)
 			return c
 		}
 
@@ -768,25 +798,25 @@ func seccompMmapRules(m *machine) {
 		if err := sighandling.ReplaceSignalHandler(unix.SIGSYS, addrOfSigsysHandler(), &savedSigsysHandler); err != nil {
 			panic(fmt.Sprintf("Unable to set handler for signal %d: %v", bluepillSignal, err))
 		}
-		rules := []seccomp.RuleSet{}
-		rules = append(rules, []seccomp.RuleSet{
+		rules := []seccomp.RuleSet{
 			// Trap mmap system calls and handle them in sigsysGoHandler
 			{
-				Rules: seccomp.SyscallRules{
-					unix.SYS_MMAP: {
-						{
-							seccomp.MatchAny{},
-							seccomp.MatchAny{},
-							seccomp.MaskedEqual(unix.PROT_EXEC, 0),
-							/* MAP_DENYWRITE is ignored and used only for filtering. */
-							seccomp.MaskedEqual(unix.MAP_DENYWRITE, 0),
-						},
+				Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+					unix.SYS_MMAP: seccomp.PerArg{
+						seccomp.AnyValue{},
+						seccomp.AnyValue{},
+						seccomp.MaskedEqual(unix.PROT_EXEC, 0),
+						/* MAP_DENYWRITE is ignored and used only for filtering. */
+						seccomp.MaskedEqual(unix.MAP_DENYWRITE, 0),
 					},
-				},
+				}),
 				Action: linux.SECCOMP_RET_TRAP,
 			},
-		}...)
-		instrs, err := seccomp.BuildProgram(rules, linux.SECCOMP_RET_ALLOW, linux.SECCOMP_RET_ALLOW)
+		}
+		instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+			DefaultAction: linux.SECCOMP_RET_ALLOW,
+			BadArchAction: linux.SECCOMP_RET_ALLOW,
+		})
 		if err != nil {
 			panic(fmt.Sprintf("failed to build rules: %v", err))
 		}

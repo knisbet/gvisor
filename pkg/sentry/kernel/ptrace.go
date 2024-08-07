@@ -123,11 +123,6 @@ func (t *Task) CanTrace(target *Task, attach bool) bool {
 		return false
 	}
 
-	// YAMA only supported for vfs2.
-	if !VFS2Enabled {
-		return true
-	}
-
 	if t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
 		t.tg.pidns.owner.mu.RLock()
 		defer t.tg.pidns.owner.mu.RUnlock()
@@ -147,11 +142,6 @@ func (t *Task) canTraceLocked(target *Task, attach bool) bool {
 
 	if !t.canTraceStandard(target, attach) {
 		return false
-	}
-
-	// YAMA only supported for vfs2.
-	if !VFS2Enabled {
-		return true
 	}
 
 	if t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
@@ -327,7 +317,7 @@ func (t *Task) SetYAMAException(tracer *Task) {
 
 // Tracer returns t's ptrace Tracer.
 func (t *Task) Tracer() *Task {
-	return t.ptraceTracer.Load().(*Task)
+	return t.ptraceTracer.Load()
 }
 
 // hasTracer returns true if t has a ptrace tracer attached.
@@ -594,8 +584,7 @@ func (t *Task) exitPtrace() {
 		// this is consistent with Linux.
 		target.forgetTracerLocked()
 	}
-	// "nil maps cannot be saved"
-	t.ptraceTracees = make(map[*Task]struct{})
+	clear(t.ptraceTracees) // nil maps cannot be saved
 
 	if t.ptraceYAMAExceptionAdded {
 		delete(t.k.ptraceExceptions, t)
@@ -616,7 +605,7 @@ func (t *Task) forgetTracerLocked() {
 	t.ptraceOpts = ptraceOptions{}
 	t.ptraceSyscallMode = ptraceSyscallNone
 	t.ptraceSinglestep = false
-	t.ptraceTracer.Store((*Task)(nil))
+	t.ptraceTracer.Store(nil)
 	if t.exitTracerNotified && !t.exitTracerAcked {
 		t.exitTracerAcked = true
 		t.exitNotifyLocked(true)
@@ -1170,8 +1159,6 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 			return err
 		}
 
-		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
-
 		ar := ars.Head()
 		n, err := target.Arch().PtraceGetRegSet(uintptr(addr), &usermem.IOReadWriter{
 			Ctx:  t,
@@ -1199,13 +1186,10 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 			return err
 		}
 
-		mm := t.MemoryManager()
-		t.p.PullFullState(mm.AddressSpace(), t.Arch())
-
 		ar := ars.Head()
 		n, err := target.Arch().PtraceSetRegSet(uintptr(addr), &usermem.IOReadWriter{
 			Ctx:  t,
-			IO:   mm,
+			IO:   t.MemoryManager(),
 			Addr: ar.Start,
 			Opts: usermem.IOOpts{
 				AddressSpaceActive: true,
@@ -1214,7 +1198,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 		if err != nil {
 			return err
 		}
-		t.p.FullStateChanged()
+		target.p.FullStateChanged()
 		ar.End -= hostarch.Addr(n)
 		return t.CopyOutIovecs(data, hostarch.AddrRangeSeqOf(ar))
 

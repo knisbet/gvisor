@@ -36,13 +36,14 @@ package overlay
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -125,6 +126,9 @@ type filesystem struct {
 	// lastDirIno is the last inode number assigned to a directory. lastDirIno
 	// is protected by dirInoCacheMu.
 	lastDirIno uint64
+
+	// MaxFilenameLen is the maximum filename length allowed by the overlayfs.
+	maxFilenameLen uint64
 }
 
 // +stateify savable
@@ -161,7 +165,29 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		delete(mopts, "upperdir")
 		// Linux overlayfs also requires a workdir when upperdir is
 		// specified; we don't, so silently ignore this option.
-		delete(mopts, "workdir")
+		if workdir, ok := mopts["workdir"]; ok {
+			// Linux creates the "work" directory in `workdir`.
+			// Docker calls chown on it and fails if it doesn't
+			// exist.
+			workdirPath := fspath.Parse(workdir + "/work")
+			if !workdirPath.Absolute {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir %q must be absolute", workdir)
+				return nil, nil, linuxerr.EINVAL
+			}
+			pop := vfs.PathOperation{
+				Root:               vfsroot,
+				Start:              vfsroot,
+				Path:               workdirPath,
+				FollowFinalSymlink: false,
+			}
+			mode := vfs.MkdirOptions{
+				Mode: linux.ModeUserAll,
+			}
+			if err := vfsObj.MkdirAt(ctx, creds, &pop, &mode); err != nil && err != linuxerr.EEXIST {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to create %s/work: %v", workdir, err)
+			}
+			delete(mopts, "workdir")
+		}
 		upperPath := fspath.Parse(upperPathname)
 		if !upperPath.Absolute {
 			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
@@ -178,6 +204,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		if err != nil {
 			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to resolve upperdir %q: %v", upperPathname, err)
 			return nil, nil, err
+		}
+		// TODO(b/286942303): Only tmpfs supports whiteouts and
+		// trusted.overlay attributes. Don't allow to use non-tmpfs
+		// mounts on upper levels for mounts created through the mount
+		// syscall. In gVisor configs, users can specify any
+		// configurations on their own risk.
+		if !opts.InternalMount && upperRoot.Mount().Filesystem().FilesystemType().Name() != "tmpfs" {
+			return nil, nil, linuxerr.EINVAL
 		}
 		privateUpperRoot, err := clonePrivateMount(vfsObj, upperRoot, false /* forceReadOnly */)
 		upperRoot.DecRef(ctx)
@@ -264,8 +298,22 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		dirDevMinor:    dirDevMinor,
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
+		maxFilenameLen: linux.NAME_MAX,
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
+
+	// Configure max filename length. Similar to what Linux does in
+	// fs/overlayfs/super.c:ovl_fill_super() -> ... -> ovl_check_namelen().
+	if fsopts.UpperRoot.Ok() {
+		if err := fs.updateMaxNameLen(ctx, creds, vfsObj, fs.opts.UpperRoot); err != nil {
+			ctx.Debugf("overlay.FilesystemType.GetFilesystem: failed to StatFSAt on upper layer root: %v", err)
+		}
+	}
+	for _, lowerRoot := range fsopts.LowerRoots {
+		if err := fs.updateMaxNameLen(ctx, creds, vfsObj, lowerRoot); err != nil {
+			ctx.Debugf("overlay.FilesystemType.GetFilesystem: failed to StatFSAt on lower layer root: %v", err)
+		}
+	}
 
 	// Construct the root dentry.
 	root := fs.newDentry()
@@ -368,6 +416,21 @@ func (fs *filesystem) Release(ctx context.Context) {
 	}
 }
 
+// updateMaxNameLen is analogous to fs/overlayfs/super.c:ovl_check_namelen().
+func (fs *filesystem) updateMaxNameLen(ctx context.Context, creds *auth.Credentials, vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry) error {
+	statfs, err := vfsObj.StatFSAt(ctx, creds, &vfs.PathOperation{
+		Root:  vd,
+		Start: vd,
+	})
+	if err != nil {
+		return err
+	}
+	if statfs.NameLength > fs.maxFilenameLen {
+		fs.maxFilenameLen = statfs.NameLength
+	}
+	return nil
+}
+
 func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 	// Always statfs the root of the topmost layer. Compare Linux's
 	// fs/overlayfs/super.c:ovl_statfs().
@@ -419,6 +482,11 @@ func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, e
 	return minor, nil
 }
 
+// IsDescendant implements vfs.FilesystemImpl.IsDescendant.
+func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
+	return genericIsDescendant(vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
 // dentry implements vfs.DentryImpl.
 //
 // +stateify savable
@@ -446,7 +514,7 @@ type dentry struct {
 	// name is this dentry's name in parent. If this dentry is a filesystem
 	// root, parent is nil and name is the empty string. parent and name are
 	// protected by fs.renameMu.
-	parent *dentry
+	parent atomic.Pointer[dentry] `state:".(*dentry)"`
 	name   string
 
 	// If this dentry represents a directory, children maps the names of
@@ -501,6 +569,10 @@ type dentry struct {
 	//
 	//	- isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
 	//		accessed using atomic memory operations.
+	//
+	//	- wrappedMappable is protected by mapsMu and dataMu. In addition,
+	//	  it has to be immutable if copyMu is taken for write.
+	//        copyUpMaybeSyntheticMountpointLocked relies on this behavior.
 	mapsMu          mapsMutex `state:"nosave"`
 	lowerMappings   memmap.MappingSet
 	dataMu          dataRWMutex `state:"nosave"`
@@ -509,7 +581,7 @@ type dentry struct {
 
 	locks vfs.FileLocks
 
-	// watches is the set of inotify watches on the file repesented by this dentry.
+	// watches is the set of inotify watches on the file represented by this dentry.
 	//
 	// Note that hard links to the same file will not share the same set of
 	// watches, due to the fact that we do not have inode structures in this
@@ -527,7 +599,7 @@ func (fs *filesystem) newDentry() *dentry {
 	}
 	d.lowerVDs = d.inlineLowerVDs[:0]
 	d.vfsd.Init(d)
-	refsvfs2.Register(d)
+	refs.Register(d)
 	return d
 }
 
@@ -537,7 +609,7 @@ func (d *dentry) IncRef() {
 	// d.checkDropLocked().
 	r := d.refs.Add(1)
 	if d.LogRefs() {
-		refsvfs2.LogIncRef(d, r)
+		refs.LogIncRef(d, r)
 	}
 }
 
@@ -550,7 +622,7 @@ func (d *dentry) TryIncRef() bool {
 		}
 		if d.refs.CompareAndSwap(r, r+1) {
 			if d.LogRefs() {
-				refsvfs2.LogTryIncRef(d, r+1)
+				refs.LogTryIncRef(d, r+1)
 			}
 			return true
 		}
@@ -561,7 +633,7 @@ func (d *dentry) TryIncRef() bool {
 func (d *dentry) DecRef(ctx context.Context) {
 	r := d.refs.Add(-1)
 	if d.LogRefs() {
-		refsvfs2.LogDecRef(d, r)
+		refs.LogDecRef(d, r)
 	}
 	if r == 0 {
 		d.fs.renameMu.Lock()
@@ -575,7 +647,7 @@ func (d *dentry) DecRef(ctx context.Context) {
 func (d *dentry) decRefLocked(ctx context.Context) {
 	r := d.refs.Add(-1)
 	if d.LogRefs() {
-		refsvfs2.LogDecRef(d, r)
+		refs.LogDecRef(d, r)
 	}
 	if r == 0 {
 		d.checkDropLocked(ctx)
@@ -635,30 +707,30 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 
 	d.watches.HandleDeletion(ctx)
 
-	if d.parent != nil {
-		d.parent.dirMu.Lock()
+	if parent := d.parent.Load(); parent != nil {
+		parent.dirMu.Lock()
 		if !d.vfsd.IsDead() {
-			delete(d.parent.children, d.name)
+			delete(parent.children, d.name)
 		}
-		d.parent.dirMu.Unlock()
+		parent.dirMu.Unlock()
 		// Drop the reference held by d on its parent without recursively
 		// locking d.fs.renameMu.
-		d.parent.decRefLocked(ctx)
+		parent.decRefLocked(ctx)
 	}
-	refsvfs2.Unregister(d)
+	refs.Unregister(d)
 }
 
-// RefType implements refsvfs2.CheckedObject.Type.
+// RefType implements refs.CheckedObject.Type.
 func (d *dentry) RefType() string {
 	return "overlay.dentry"
 }
 
-// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+// LeakMessage implements refs.CheckedObject.LeakMessage.
 func (d *dentry) LeakMessage() string {
 	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, d.refs.Load())
 }
 
-// LogRefs implements refsvfs2.CheckedObject.LogRefs.
+// LogRefs implements refs.CheckedObject.LogRefs.
 //
 // This should only be set to true for debugging purposes, as it can generate an
 // extremely large amount of output and drastically degrade performance.
@@ -678,8 +750,8 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie ui
 
 	d.fs.renameMu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
-	if d.parent != nil {
-		d.parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
+	if parent := d.parent.Load(); parent != nil {
+		parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
 	}
 	d.watches.Notify(ctx, "", events, cookie, et, deleted)
 	d.fs.renameMu.RUnlock()
@@ -845,31 +917,15 @@ func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOption
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	fs := fd.filesystem()
-	d := fd.dentry()
-
 	fs.renameMu.RLock()
-	err := fs.setXattrLocked(ctx, d, fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
-	fs.renameMu.RUnlock()
-	if err != nil {
-		return err
-	}
-
-	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
+	defer fs.renameMu.RUnlock()
+	return fs.setXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	fs := fd.filesystem()
-	d := fd.dentry()
-
 	fs.renameMu.RLock()
-	err := fs.removeXattrLocked(ctx, d, fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
-	fs.renameMu.RUnlock()
-	if err != nil {
-		return err
-	}
-
-	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
+	defer fs.renameMu.RUnlock()
+	return fs.removeXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
 }

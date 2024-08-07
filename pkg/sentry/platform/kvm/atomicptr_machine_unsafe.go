@@ -1,6 +1,7 @@
 package kvm
 
 import (
+	"context"
 	"sync/atomic"
 	"unsafe"
 )
@@ -21,7 +22,7 @@ func (p *machineAtomicPtr) savePtr() *machine {
 	return p.Load()
 }
 
-func (p *machineAtomicPtr) loadPtr(v *machine) {
+func (p *machineAtomicPtr) loadPtr(_ context.Context, v *machine) {
 	p.Store(v)
 }
 
@@ -36,4 +37,9 @@ func (p *machineAtomicPtr) Load() *machine {
 // Store sets the value returned by Load to x.
 func (p *machineAtomicPtr) Store(x *machine) {
 	atomic.StorePointer(&p.ptr, (unsafe.Pointer)(x))
+}
+
+// Swap atomically stores `x` into *p and returns the previous *p value.
+func (p *machineAtomicPtr) Swap(x *machine) *machine {
+	return (*machine)(atomic.SwapPointer(&p.ptr, (unsafe.Pointer)(x)))
 }
